@@ -7,6 +7,7 @@ from models.incidents import IncidentCluster, Incident
 from models.hypotheses import RootCauseAnalysis
 from models.actions import ActionPlan, Approval, ExecutedAction
 from models.outcomes import ActionOutcome
+from models.anomalies import AnomalySignal
 
 
 class AgentState(TypedDict):
@@ -15,6 +16,7 @@ class AgentState(TypedDict):
     # Data pipeline
     raw_events: List[RawEvent]
     clean_events: List[CleanEvent]
+    anomaly_signals: List[AnomalySignal]  # Early warnings from Agent 10
     clusters: List[IncidentCluster]
     incidents: List[Incident]
     analyses: List[RootCauseAnalysis]

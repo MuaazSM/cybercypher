@@ -2,6 +2,55 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Literal, Optional, Dict, Any
 from datetime import datetime
 from uuid import UUID, uuid4
+from enum import Enum
+
+
+class ConfidenceTier(str, Enum):
+    """
+    Confidence-based escalation tiers (Priority 8 Enhancement).
+    
+    Maps hypothesis confidence to graduated response levels:
+    - WAIT: 0.0-0.3 - Don't act, gather more data
+    - MONITOR: 0.3-0.6 - Low-risk actions only (support guidance)
+    - ACT: 0.6-0.8 - Normal escalation and communications
+    - URGENT: 0.8-1.0 - Fast-track all actions, auto-approve safe ones
+    """
+    WAIT = "WAIT"
+    MONITOR = "MONITOR"
+    ACT = "ACT"
+    URGENT = "URGENT"
+
+
+def confidence_to_tier(confidence: float) -> ConfidenceTier:
+    """
+    Convert confidence score to escalation tier.
+    
+    Priority 8 Enhancement: Risk-aware decision-making
+    
+    Args:
+        confidence: Confidence score 0.0-1.0
+    
+    Returns:
+        ConfidenceTier for graduated response
+    
+    Examples:
+        >>> confidence_to_tier(0.25)
+        ConfidenceTier.WAIT
+        >>> confidence_to_tier(0.45)
+        ConfidenceTier.MONITOR
+        >>> confidence_to_tier(0.75)
+        ConfidenceTier.ACT
+        >>> confidence_to_tier(0.92)
+        ConfidenceTier.URGENT
+    """
+    if confidence < 0.3:
+        return ConfidenceTier.WAIT
+    elif confidence < 0.6:
+        return ConfidenceTier.MONITOR
+    elif confidence < 0.8:
+        return ConfidenceTier.ACT
+    else:  # >= 0.8
+        return ConfidenceTier.URGENT
 
 
 class Action(BaseModel):
@@ -68,6 +117,10 @@ class ActionPlan(BaseModel):
     hypothesis_id: Optional[UUID] = Field(default=None, description="Top hypothesis this plan is based on")
     total_risk_score: float = Field(description="Aggregate risk score of all actions")
     estimated_blast_radius: int = Field(description="Expected number of affected merchants")
+    execution_strategy: Optional[str] = Field(
+        default=None,
+        description="Execution strategy (e.g., sequential, parallel, gathering_more_evidence)"
+    )
     
     model_config = ConfigDict(
         json_schema_extra={

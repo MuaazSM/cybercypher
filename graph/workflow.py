@@ -1,10 +1,16 @@
 from typing import Optional
 from datetime import datetime
+import logging
 
 from langgraph.graph import StateGraph, END
 
 from graph.state import AgentState
 from db.database import SessionLocal
+from models.actions import ConfidenceTier, confidence_to_tier
+from models.hypotheses import Hypothesis
+from models.incidents import Incident
+
+logger = logging.getLogger(__name__)
 
 
 class AgenticWorkflow:
@@ -48,11 +54,15 @@ class AgenticWorkflow:
         return workflow.compile()
 
     def _observe_node(self, state: AgentState) -> AgentState:
-        """Observe pipeline: ingest → normalize → detect patterns"""
+        """Observe pipeline: anomaly detection → normalization → pattern detection"""
         print("[Graph] OBSERVE stage")
 
         db = SessionLocal()
         try:
+            # Early anomaly detection (proactive sensing)
+            anomaly_report = self.agents["anomaly_detection"].scan_for_anomalies(db, lookback_minutes=120)
+            state["anomaly_signals"] = anomaly_report.signals
+            
             # Normalization
             self.agents["normalization"].process_raw_events(db, limit=200)
 
@@ -95,7 +105,11 @@ class AgenticWorkflow:
         return state
 
     def _decide_node(self, state: AgentState) -> AgentState:
-        """Decide pipeline: plan actions"""
+        """
+        Decide pipeline: plan actions with confidence-based graduated response.
+        
+        Priority 8 Enhancement: Confidence-Based Escalation
+        """
         print("[Graph] DECIDE stage")
 
         action_plans = []
@@ -103,8 +117,30 @@ class AgenticWorkflow:
         db = SessionLocal()
         try:
             for incident, analysis in zip(state.get("incidents", []), state.get("analyses", [])):
-                plan = self.agents["planner"].plan_actions(incident, analysis, db)
-                action_plans.append(plan)
+                # Priority 8: Apply graduated response based on confidence
+                top_hypothesis = analysis.hypotheses[0] if analysis.hypotheses else None
+                
+                if top_hypothesis:
+                    confidence_tier = confidence_to_tier(top_hypothesis.confidence)
+                    
+                    logger.info(
+                        f"[Workflow] Confidence {top_hypothesis.confidence:.2f} → {confidence_tier.value} tier"
+                    )
+                    
+                    # Apply graduated response
+                    filtered_plan = self.graduated_response_based_on_confidence(
+                        incident=incident,
+                        analysis=analysis,
+                        confidence_tier=confidence_tier,
+                        db=db
+                    )
+                    
+                    if filtered_plan:
+                        action_plans.append(filtered_plan)
+                else:
+                    # No hypotheses - default to normal planning
+                    plan = self.agents["planner"].plan_actions(incident, analysis, db)
+                    action_plans.append(plan)
         finally:
             db.close()
 
@@ -112,6 +148,114 @@ class AgenticWorkflow:
         state["current_stage"] = "decide"
 
         return state
+
+    def graduated_response_based_on_confidence(
+        self,
+        incident: Incident,
+        analysis,  # RootCauseAnalysis
+        confidence_tier: ConfidenceTier,
+        db
+    ):
+        """
+        Apply graduated response strategy based on confidence tier.
+        
+        Priority 8 Enhancement: Risk-Aware Decision-Making
+        
+        Tiers:
+        - WAIT (0.0-0.3): Don't act, gather more data
+        - MONITOR (0.3-0.6): Support guidance only, no escalation
+        - ACT (0.6-0.8): Normal escalation and communications
+        - URGENT (0.8-1.0): Fast-track all actions, auto-approve safe ones
+        
+        Args:
+            incident: The incident requiring actions
+            analysis: Root cause analysis with hypotheses
+            confidence_tier: Computed confidence tier
+            db: Database session
+        
+        Returns:
+            Filtered ActionPlan based on confidence tier, or None if WAIT
+        """
+        logger.info(
+            f"[Workflow] Applying {confidence_tier.value} tier response for incident {incident.incident_id}"
+        )
+        
+        # Generate baseline action plan
+        plan = self.agents["planner"].plan_actions(incident, analysis, db)
+        
+        if confidence_tier == ConfidenceTier.WAIT:
+            # WAIT: Don't act, gather more evidence
+            logger.warning(
+                f"[Workflow] Confidence too low ({analysis.hypotheses[0].confidence:.2f}) → "
+                "WAIT tier → Gathering more evidence, no actions"
+            )
+            
+            # Return empty plan with special status
+            plan.actions = []
+            plan.execution_strategy = "gathering_more_evidence"
+            
+            return plan
+        
+        elif confidence_tier == ConfidenceTier.MONITOR:
+            # MONITOR: Support guidance only, no external actions
+            logger.info(
+                f"[Workflow] Confidence moderate ({analysis.hypotheses[0].confidence:.2f}) → "
+                "MONITOR tier → Support guidance only, skipping escalation"
+            )
+            
+            # Filter to only support_guidance
+            plan.actions = [
+                action for action in plan.actions
+                if action.action_type == "support_guidance"
+            ]
+            
+            # Add confidence tier to payload
+            for action in plan.actions:
+                action.payload["confidence_tier"] = confidence_tier.value
+                action.payload["reason"] = "Confidence in MONITOR range - low-risk action only"
+            
+            logger.info(
+                f"[Workflow] MONITOR tier: {len(plan.actions)} support guidance actions retained"
+            )
+            
+            return plan
+        
+        elif confidence_tier == ConfidenceTier.ACT:
+            # ACT: Normal action plan
+            logger.info(
+                f"[Workflow] Confidence good ({analysis.hypotheses[0].confidence:.2f}) → "
+                "ACT tier → Normal escalation and communications"
+            )
+            
+            # Add confidence tier to all actions
+            for action in plan.actions:
+                action.payload["confidence_tier"] = confidence_tier.value
+            
+            return plan
+        
+        else:  # ConfidenceTier.URGENT
+            # URGENT: Fast-track, high priority, auto-approve safe actions
+            logger.warning(
+                f"[Workflow] Confidence very high ({analysis.hypotheses[0].confidence:.2f}) → "
+                "URGENT tier → Fast-tracking all actions"
+            )
+            
+            # Boost all action priorities
+            for idx, action in enumerate(plan.actions):
+                action.priority = min(action.priority, 2)  # Top 2 priorities
+                action.payload["confidence_tier"] = confidence_tier.value
+                action.payload["fast_track"] = True
+                action.payload["reason"] = "High confidence - urgent response required"
+                
+                # Auto-approve low-risk actions in URGENT tier
+                if action.risk_level == "low" and incident.severity in ["high", "critical"]:
+                    action.requires_approval = False
+                    action.payload["auto_approved_reason"] = "URGENT tier + high severity + low risk"
+                    logger.info(
+                        f"[Workflow] URGENT tier: Auto-approving low-risk {action.action_type}"
+                    )
+            
+            return plan
 
     def _approve_node(self, state: AgentState) -> AgentState:
         """Approval gate: check policies"""

@@ -59,12 +59,85 @@ class Hypothesis(BaseModel):
     )
 
 
+class AlternativeHypothesis(BaseModel):
+    """
+    Counter-hypothesis that challenges the primary explanation.
+    
+    Priority 6 Enhancement: Multi-Agent Debate / Intellectual Humility
+    
+    Represents alternative explanations that the AI intentionally generates
+    to avoid confirmation bias and demonstrate intellectual humility.
+    
+    Example: If top hypothesis is "platform_regression", alternative might be
+    "merchant_config" with reasoning about why we might be wrong.
+    """
+    
+    alternative_id: UUID = Field(default_factory=uuid4, description="Unique alternative ID")
+    type: Literal["merchant_config", "migration_misstep", "platform_regression", "docs_gap"] = Field(
+        description="Category of alternative root cause"
+    )
+    claim: str = Field(description="Counter-claim challenging the primary hypothesis")
+    plausibility: float = Field(
+        description="Plausibility score 0.0-1.0 (typically lower than primary)",
+        ge=0.0,
+        le=1.0
+    )
+    
+    # Evidence supporting the alternative explanation
+    contradicting_evidence: List[str] = Field(
+        description="Evidence from the same data that supports this alternative"
+    )
+    explanatory_power: str = Field(
+        description="How well this alternative explains the observations"
+    )
+    
+    # Comparative reasoning
+    why_we_might_be_wrong: str = Field(
+        description="Explicit reasoning about how our primary hypothesis could be incorrect"
+    )
+    why_primary_is_stronger: str = Field(
+        description="Why the primary hypothesis is still more likely (for transparency)"
+    )
+    
+    # What would validate this alternative
+    what_would_prove_this: List[str] = Field(
+        description="Evidence that would increase confidence in this alternative"
+    )
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "alternative_id": "850e8400-e29b-41d4-a716-446655440040",
+                "type": "merchant_config",
+                "claim": "Merchants misconfigured webhook URLs, not a migration guide issue",
+                "plausibility": 0.35,
+                "contradicting_evidence": [
+                    "Even experienced technical merchants are affected",
+                    "Multiple merchants failing at same time suggests common cause",
+                    "Webhook URL format is clearly documented"
+                ],
+                "explanatory_power": "Could explain why only Stage 2 merchants are affected if they all use same setup flow",
+                "why_we_might_be_wrong": "If merchants independently made the same mistake, it suggests the documentation is misleading them systematically - which would actually support the migration_misstep hypothesis",
+                "why_primary_is_stronger": "17/17 merchants in Stage 2 suggests systematic issue with migration process, not independent merchant errors. Historical data shows merchants usually get this right.",
+                "what_would_prove_this": [
+                    "Merchant account inspection shows incorrect webhook URL format",
+                    "Merchants confirm they didn't follow documentation exactly",
+                    "Similar issues appearing in Stage 3/4 (different setup flows)"
+                ]
+            }
+        }
+    )
+
+
 class RootCauseAnalysis(BaseModel):
     """
     Complete root cause analysis for an incident.
     
     Contains ranked hypotheses, recommended next steps,
     and metadata about the analysis process.
+    
+    Priority 6 Enhancement: Now includes alternative_explanations
+    to demonstrate intellectual humility and adversarial thinking.
     """
     
     incident_id: UUID = Field(description="The incident being analyzed")
@@ -73,6 +146,16 @@ class RootCauseAnalysis(BaseModel):
     # Hypotheses ranked by confidence
     hypotheses: List[Hypothesis] = Field(
         description="Root cause hypotheses ranked by confidence (highest first)"
+    )
+    
+    # Priority 6: Alternative explanations (intellectual humility)
+    alternative_explanations: List[AlternativeHypothesis] = Field(
+        default_factory=list,
+        description="Counter-hypotheses that challenge our primary explanation"
+    )
+    debate_summary: Optional[str] = Field(
+        default=None,
+        description="Summary of why primary hypothesis was chosen over alternatives"
     )
     
     # Recommendations

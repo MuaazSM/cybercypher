@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 from models.actions import Action, Approval
 from db.models import ActionDB, ApprovalDB
@@ -81,6 +81,8 @@ class PolicyApprovalAgent:
         """
         Evaluate action against policies and create approval record.
         
+        Priority 8 Enhancement: Considers confidence tier in approval decisions
+        
         Args:
             action: Action to evaluate
             incident_severity: Incident severity (low, medium, high, critical)
@@ -92,6 +94,10 @@ class PolicyApprovalAgent:
         """
         logger.info(f"[PolicyApprovalAgent] Evaluating action: {action.action_type} (priority {action.priority})")
         
+        # Priority 8: Extract confidence tier from action payload
+        confidence_tier = action.payload.get("confidence_tier", "ACT")
+        fast_track = action.payload.get("fast_track", False)
+        
         # Run policy checks
         policy_results = self._run_policy_checks(
             action, incident_severity, incident_impacts_checkout
@@ -99,6 +105,27 @@ class PolicyApprovalAgent:
         
         # Determine if approval is required
         requires_approval = action.requires_approval or any(policy_results.values())
+        
+        # Priority 8: Apply confidence tier logic
+        if confidence_tier == "WAIT" or confidence_tier == "MONITOR":
+            # WAIT/MONITOR tier: Block all external communications
+            if action.action_type in ["proactive_comms", "escalate_eng"]:
+                logger.warning(
+                    f"[PolicyApprovalAgent] Blocking {action.action_type} - "
+                    f"confidence tier {confidence_tier} restricts external actions"
+                )
+                policy_results["confidence_tier_restriction"] = True
+                requires_approval = True
+        
+        elif confidence_tier == "URGENT":
+            # URGENT tier + high severity: Auto-approve more actions
+            if incident_severity in ["high", "critical"] and action.risk_level != "high":
+                requires_approval = False
+                logger.info(
+                    f"[PolicyApprovalAgent] URGENT tier + {incident_severity} severity → "
+                    f"Auto-approving {action.risk_level}-risk {action.action_type}"
+                )
+                policy_results["urgent_tier_auto_approve"] = True
         
         # Override: Auto-approve low-risk internal actions
         if (action.risk_level == "low" and 
@@ -122,6 +149,11 @@ class PolicyApprovalAgent:
         if not requires_approval:
             approval.approved_by = "system_auto"
             approval.approved_at = datetime.utcnow()
+            
+            # Add confidence tier context to approval
+            if fast_track:
+                approval.approval_metadata = {"fast_tracked": True, "confidence_tier": confidence_tier}
+            
             logger.info(f"[PolicyApprovalAgent] Auto-approved {action.action_type}")
         else:
             logger.info(
@@ -476,3 +508,227 @@ class PolicyApprovalAgent:
             logger.error(f"[PolicyApprovalAgent] Error storing approval: {e}")
             db.rollback()
             raise
+
+    def update_policy_thresholds(
+        self,
+        approval_patterns: Dict,
+        db: Session
+    ) -> Dict:
+        """
+        Update approval policies based on human approver patterns.
+        
+        Learns from data:
+        - If approvers reject high-risk actions → lower risk threshold
+        - If approvers approve low-confidence escalations → adjust confidence threshold
+        - If approvers fast-track critical incidents → lower escalation threshold
+        
+        Args:
+            approval_patterns: Dict from FeedbackLearningAgent.learn_from_approver_decisions()
+            db: Database session
+        
+        Returns:
+            Dict with updated thresholds and reasoning
+            Example:
+            {
+                "escalate_eng_confidence": {
+                    "previous": 0.6,
+                    "current": 0.5,
+                    "reason": "Approvers approved 90% of >0.5 confidence escalations"
+                },
+                "proactive_comms_confidence": {
+                    "previous": 0.7,
+                    "current": 0.75,
+                    "reason": "Approvers rejected 70% of <0.6 confidence comms"
+                }
+            }
+        """
+        from db.models import PolicyThresholdDB
+        from typing import Tuple
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        logger.info("[PolicyApprovalAgent] Updating policy thresholds based on approval patterns...")
+        
+        updates = {}
+        
+        # Rule 1: Escalation confidence threshold
+        # If approvers approve most escalations at >0.5 confidence, lower the threshold
+        escalate_eng_patterns = approval_patterns.get("by_action_type", {}).get("escalate_eng", {})
+        if escalate_eng_patterns.get("approved", 0) > 0:
+            escalate_approval_rate = escalate_eng_patterns.get("rate", 0.5)
+            
+            if escalate_approval_rate > 0.85:  # >85% approval rate
+                new_threshold, reason = self._adjust_escalation_threshold(
+                    escalate_approval_rate,
+                    approval_patterns.get("total_approvals", 1)
+                )
+                updates["escalate_eng_confidence"] = {
+                    "new_threshold": new_threshold,
+                    "reasoning": reason,
+                    "approval_rate": escalate_approval_rate
+                }
+                logger.info(
+                    f"[PolicyApprovalAgent] Escalation approval rate: {escalate_approval_rate:.1%} → "
+                    f"consider lowering confidence threshold to {new_threshold}"
+                )
+        
+        # Rule 2: Communication confidence threshold
+        # If approvers reject most <0.5 confidence comms, increase requirement
+        proactive_patterns = approval_patterns.get("by_action_type", {}).get("proactive_comms", {})
+        if proactive_patterns.get("rejected", 0) > 0:
+            comms_approval_rate = proactive_patterns.get("rate", 0.5)
+            
+            if comms_approval_rate < 0.50:  # <50% approval rate
+                new_threshold, reason = self._adjust_comms_threshold(
+                    comms_approval_rate,
+                    approval_patterns.get("total_approvals", 1)
+                )
+                updates["proactive_comms_confidence"] = {
+                    "new_threshold": new_threshold,
+                    "reasoning": reason,
+                    "approval_rate": comms_approval_rate
+                }
+                logger.info(
+                    f"[PolicyApprovalAgent] Comms approval rate: {comms_approval_rate:.1%} → "
+                    f"consider increasing confidence threshold to {new_threshold}"
+                )
+        
+        # Rule 3: Risk-level based policies
+        # If approvers reject most high-risk actions, tighten approval requirements
+        high_risk_patterns = approval_patterns.get("by_risk_level", {}).get("high", {})
+        if high_risk_patterns.get("total", 0) > 0:
+            high_risk_approval_rate = high_risk_patterns.get("rate", 0.5)
+            
+            if high_risk_approval_rate < 0.30:  # <30% approval rate
+                updates["high_risk_approval"] = {
+                    "new_policy": "require_escalation",
+                    "reasoning": f"Approvers reject {(1-high_risk_approval_rate):.1%} of high-risk actions → require escalation",
+                    "approval_rate": high_risk_approval_rate
+                }
+                logger.warning(
+                    f"[PolicyApprovalAgent] High-risk actions approval rate: {high_risk_approval_rate:.1%} → "
+                    "consider requiring escalation instead of direct approval"
+                )
+        
+        # Rule 4: Confidence-based auto-approval
+        # If >0.8 confidence escalations are always approved, auto-approve them
+        very_high_conf = approval_patterns.get("by_confidence_range", {}).get("0.8-1.0", {})
+        if very_high_conf.get("approved", 0) > 2:
+            very_high_rate = very_high_conf.get("rate", 0)
+            if very_high_rate >= 0.95:  # >=95% approval rate
+                updates["auto_approve_very_high_confidence"] = {
+                    "new_policy": "auto_approve",
+                    "applies_to": "escalate_eng",
+                    "confidence_threshold": 0.85,
+                    "reasoning": f"Approvers approved {very_high_rate:.1%} of >0.85 confidence escalations",
+                    "approval_rate": very_high_rate
+                }
+                logger.info(
+                    f"[PolicyApprovalAgent] >0.85 confidence escalations: {very_high_rate:.1%} approval → "
+                    "can auto-approve these"
+                )
+        
+        # Persist threshold updates to database
+        self._persist_policy_updates(updates, db, approval_patterns.get("total_approvals", 0))
+        
+        logger.info(f"[PolicyApprovalAgent] Updated {len(updates)} policy thresholds")
+        return updates
+    
+    def _adjust_escalation_threshold(
+        self,
+        approval_rate: float,
+        sample_size: int
+    ) -> Tuple[float, str]:
+        """Determine new escalation confidence threshold based on approval rate"""
+        # Higher approval rate → lower threshold (make it easier to escalate)
+        if approval_rate > 0.95:
+            return 0.40, "Very high approval rate (>95%) - significantly lower threshold"
+        elif approval_rate > 0.90:
+            return 0.50, "High approval rate (>90%) - lower threshold"
+        elif approval_rate > 0.85:
+            return 0.55, "Good approval rate (>85%) - slightly lower threshold"
+        else:
+            return 0.60, "Moderate approval rate - maintain current threshold"
+    
+    def _adjust_comms_threshold(
+        self,
+        approval_rate: float,
+        sample_size: int
+    ) -> Tuple[float, str]:
+        """Determine new comms confidence threshold based on rejection patterns"""
+        # Lower approval rate → higher threshold (more strict)
+        if approval_rate < 0.30:
+            return 0.80, "Very low approval rate (<30%) - significantly increase threshold"
+        elif approval_rate < 0.40:
+            return 0.75, "Low approval rate (<40%) - increase threshold"
+        elif approval_rate < 0.50:
+            return 0.70, "Below 50% approval - moderately increase threshold"
+        else:
+            return 0.65, "Moderate approval rate - adjust slightly"
+    
+    def _persist_policy_updates(
+        self,
+        updates: Dict,
+        db: Session,
+        approval_count: int
+    ) -> None:
+        """Persist policy threshold updates to database"""
+        from db.models import PolicyThresholdDB
+        from uuid import uuid4
+        
+        for policy_name, update_info in updates.items():
+            if "new_threshold" in update_info:
+                # Check if policy exists
+                existing = db.query(PolicyThresholdDB).filter(
+                    PolicyThresholdDB.policy_name == policy_name
+                ).first()
+                
+                if existing:
+                    existing.previous_value = existing.current_value
+                    existing.current_value = update_info["new_threshold"]
+                    existing.updated_at = datetime.utcnow()
+                    existing.update_reason = update_info["reasoning"]
+                    existing.based_on_n_approvals = approval_count
+                    existing.approval_rate = update_info.get("approval_rate")
+                    existing.rejection_rate = 1.0 - update_info.get("approval_rate", 0.5)
+                    existing.updated_by = "feedback_learning_agent"
+                    
+                    logger.info(
+                        f"[PolicyApprovalAgent] Updated {policy_name}: "
+                        f"{existing.previous_value} → {existing.current_value}"
+                    )
+                else:
+                    # Create new policy threshold
+                    new_policy = PolicyThresholdDB(
+                        threshold_id=uuid4(),
+                        policy_name=policy_name,
+                        applies_to=update_info.get("applies_to", "escalate_eng"),
+                        current_value=update_info["new_threshold"],
+                        previous_value=None,
+                        updated_at=datetime.utcnow(),
+                        update_reason=update_info["reasoning"],
+                        based_on_n_approvals=approval_count,
+                        approval_rate=update_info.get("approval_rate"),
+                        rejection_rate=1.0 - update_info.get("approval_rate", 0.5),
+                        updated_by="feedback_learning_agent",
+                        confidence_in_change=min(approval_count / 20.0, 1.0),  # More data = more confidence
+                        sample_size=approval_count
+                    )
+                    db.add(new_policy)
+                    logger.info(f"[PolicyApprovalAgent] Created new policy: {policy_name}")
+            
+            elif "new_policy" in update_info:
+                # Track policy rule changes (for audit)
+                logger.info(
+                    f"[PolicyApprovalAgent] Policy change: {policy_name} → {update_info['new_policy']} "
+                    f"({update_info['reasoning']})"
+                )
+        
+        try:
+            db.commit()
+            logger.info("[PolicyApprovalAgent] Policy updates persisted to database")
+        except Exception as e:
+            logger.error(f"[PolicyApprovalAgent] Error persisting policy updates: {e}")
+            db.rollback()
+            raise
+

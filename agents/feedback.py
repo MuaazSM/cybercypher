@@ -329,3 +329,212 @@ class FeedbackLearningAgent:
             confidence_score=db_outcome.confidence_score,
             should_update_patterns=db_outcome.should_update_patterns
         )
+
+    def learn_from_approver_decisions(self, db: Session) -> dict:
+        """
+        Analyze approval patterns to improve future recommendations.
+        
+        Tracks:
+        - Which actions do approvers accept vs reject?
+        - Which confidence thresholds trigger approval?
+        - Which hypothesis types are approved faster?
+        - Approval rates by risk level
+        
+        Returns:
+            Dict with approval patterns by action_type, risk_level, confidence
+            Example:
+            {
+                "by_action_type": {
+                    "escalate_eng": {"approved": 12, "rejected": 2, "rate": 0.857},
+                    "proactive_comms": {"approved": 5, "rejected": 8, "rate": 0.385}
+                },
+                "by_risk_level": {
+                    "low": {"approved": 15, "rejected": 1, "rate": 0.938},
+                    "high": {"approved": 8, "rejected": 12, "rate": 0.400}
+                },
+                "by_confidence_range": {
+                    "0.0-0.3": {"approved": 1, "rejected": 8, "rate": 0.111},
+                    "0.3-0.6": {"approved": 8, "rejected": 5, "rate": 0.615},
+                    "0.6-0.8": {"approved": 12, "rejected": 3, "rate": 0.800},
+                    "0.8-1.0": {"approved": 15, "rejected": 0, "rate": 1.000}
+                },
+                "approval_speed": {
+                    "fast_approve": {"avg_minutes": 5.2, "count": 18},
+                    "delayed_review": {"avg_minutes": 45.1, "count": 8}
+                },
+                "rejection_reasons": {
+                    "insufficient_confidence": 5,
+                    "high_risk_too_broad": 4,
+                    "alternative_preferred": 3
+                }
+            }
+        """
+        from db.models import ApprovalDB, ActionDB
+        from collections import defaultdict
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        logger.info("[FeedbackLearning] Analyzing approver decision patterns...")
+        
+        # Get all approvals with decisions
+        approvals = db.query(ApprovalDB).filter(
+            ApprovalDB.status.in_(["approved", "rejected"])
+        ).all()
+        
+        if not approvals:
+            logger.warning("[FeedbackLearning] No approval decisions found")
+            return {"error": "No approval data available"}
+        
+        logger.debug(f"[FeedbackLearning] Analyzing {len(approvals)} approval decisions")
+        
+        # Initialize pattern tracking
+        approval_patterns = {
+            "by_action_type": defaultdict(lambda: {"approved": 0, "rejected": 0, "rate": 0.0}),
+            "by_risk_level": defaultdict(lambda: {"approved": 0, "rejected": 0, "rate": 0.0}),
+            "by_confidence_range": {
+                "0.0-0.3": {"approved": 0, "rejected": 0, "rate": 0.0},
+                "0.3-0.6": {"approved": 0, "rejected": 0, "rate": 0.0},
+                "0.6-0.8": {"approved": 0, "rejected": 0, "rate": 0.0},
+                "0.8-1.0": {"approved": 0, "rejected": 0, "rate": 0.0}
+            },
+            "approval_speed": {"fast_approve": {"total_minutes": 0, "count": 0}, "delayed_review": {"total_minutes": 0, "count": 0}},
+            "rejection_reasons": defaultdict(int),
+            "total_approvals": len(approvals),
+            "approval_rate_overall": 0.0
+        }
+        
+        # Analyze each approval
+        for approval in approvals:
+            # Get action details
+            action_db = db.query(ActionDB).filter(
+                ActionDB.action_id == approval.action_id
+            ).first()
+            
+            if not action_db:
+                logger.warning(f"[FeedbackLearning] Action not found for approval {approval.approval_id}")
+                continue
+            
+            action_type = action_db.action_type
+            risk_level = action_db.risk_level
+            approval_status = "approved" if approval.status == "approved" else "rejected"
+            
+            # Track by action type
+            approval_patterns["by_action_type"][action_type][approval_status] += 1
+            
+            # Track by risk level
+            approval_patterns["by_risk_level"][risk_level][approval_status] += 1
+            
+            # Track by confidence threshold (extract from policy_checks if available)
+            confidence = self._extract_confidence_from_policy_checks(approval.policy_checks)
+            if confidence is not None:
+                confidence_range = self._get_confidence_range(confidence)
+                approval_patterns["by_confidence_range"][confidence_range][approval_status] += 1
+            
+            # Track approval speed
+            if approval.approved_at:
+                time_to_approve = (approval.approved_at - approval.requested_at).total_seconds() / 60
+                if time_to_approve <= 15:  # Fast approval
+                    approval_patterns["approval_speed"]["fast_approve"]["total_minutes"] += time_to_approve
+                    approval_patterns["approval_speed"]["fast_approve"]["count"] += 1
+                else:  # Delayed review
+                    approval_patterns["approval_speed"]["delayed_review"]["total_minutes"] += time_to_approve
+                    approval_patterns["approval_speed"]["delayed_review"]["count"] += 1
+            
+            # Track rejection reasons
+            if approval.status == "rejected" and approval.rejection_reason:
+                reason = approval.rejection_reason.lower()
+                if "confidence" in reason:
+                    approval_patterns["rejection_reasons"]["insufficient_confidence"] += 1
+                elif "risk" in reason or "blast" in reason:
+                    approval_patterns["rejection_reasons"]["high_risk_too_broad"] += 1
+                elif "alternative" in reason or "prefer" in reason:
+                    approval_patterns["rejection_reasons"]["alternative_preferred"] += 1
+                else:
+                    approval_patterns["rejection_reasons"]["other"] += 1
+        
+        # Calculate rates
+        for action_type, counts in approval_patterns["by_action_type"].items():
+            total = counts["approved"] + counts["rejected"]
+            if total > 0:
+                counts["rate"] = counts["approved"] / total
+        
+        for risk_level, counts in approval_patterns["by_risk_level"].items():
+            total = counts["approved"] + counts["rejected"]
+            if total > 0:
+                counts["rate"] = counts["approved"] / total
+        
+        for conf_range, counts in approval_patterns["by_confidence_range"].items():
+            total = counts["approved"] + counts["rejected"]
+            if total > 0:
+                counts["rate"] = counts["approved"] / total
+        
+        # Calculate average approval speeds
+        if approval_patterns["approval_speed"]["fast_approve"]["count"] > 0:
+            approval_patterns["approval_speed"]["fast_approve"]["avg_minutes"] = (
+                approval_patterns["approval_speed"]["fast_approve"]["total_minutes"] /
+                approval_patterns["approval_speed"]["fast_approve"]["count"]
+            )
+            del approval_patterns["approval_speed"]["fast_approve"]["total_minutes"]
+        
+        if approval_patterns["approval_speed"]["delayed_review"]["count"] > 0:
+            approval_patterns["approval_speed"]["delayed_review"]["avg_minutes"] = (
+                approval_patterns["approval_speed"]["delayed_review"]["total_minutes"] /
+                approval_patterns["approval_speed"]["delayed_review"]["count"]
+            )
+            del approval_patterns["approval_speed"]["delayed_review"]["total_minutes"]
+        
+        # Calculate overall approval rate
+        total_approved = sum(c["approved"] for c in approval_patterns["by_action_type"].values())
+        total_count = approval_patterns["total_approvals"]
+        approval_patterns["approval_rate_overall"] = total_approved / total_count if total_count > 0 else 0.0
+        
+        # Log insights
+        logger.info(
+            f"[FeedbackLearning] Overall approval rate: {approval_patterns['approval_rate_overall']:.1%} "
+            f"({total_approved}/{total_count})"
+        )
+        
+        for action_type, counts in approval_patterns["by_action_type"].items():
+            logger.info(
+                f"[FeedbackLearning] {action_type}: {counts['approved']}/{counts['approved']+counts['rejected']} "
+                f"approved ({counts['rate']:.1%})"
+            )
+        
+        # Convert defaultdict to regular dict for JSON serialization
+        approval_patterns["by_action_type"] = dict(approval_patterns["by_action_type"])
+        approval_patterns["by_risk_level"] = dict(approval_patterns["by_risk_level"])
+        approval_patterns["rejection_reasons"] = dict(approval_patterns["rejection_reasons"])
+        
+        return approval_patterns
+    
+    def _extract_confidence_from_policy_checks(self, policy_checks: dict) -> Optional[float]:
+        """Extract confidence score from policy_checks JSON"""
+        if not policy_checks:
+            return None
+        
+        if isinstance(policy_checks, str):
+            import json
+            try:
+                policy_checks = json.loads(policy_checks)
+            except:
+                return None
+        
+        # Look for confidence in various places
+        if "confidence" in policy_checks:
+            return policy_checks["confidence"]
+        if "confidence_score" in policy_checks:
+            return policy_checks["confidence_score"]
+        
+        return None
+    
+    def _get_confidence_range(self, confidence: float) -> str:
+        """Map confidence score to range"""
+        if confidence < 0.3:
+            return "0.0-0.3"
+        elif confidence < 0.6:
+            return "0.3-0.6"
+        elif confidence < 0.8:
+            return "0.6-0.8"
+        else:
+            return "0.8-1.0"
+

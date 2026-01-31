@@ -344,6 +344,41 @@ class ActionOutcomeDB(Base):
     )
 
 
+class ActionSimulationDB(Base):
+    """
+    Simulation runs for "what-if" analysis (Priority 9: Simulation Mode).
+    Stores predicted outcomes and comparison to alternatives before execution.
+    """
+    __tablename__ = "action_simulations"
+
+    simulation_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    incident_id = Column(UUID(as_uuid=True), ForeignKey('incidents.incident_id'), nullable=False)
+    action_id = Column(UUID(as_uuid=True), nullable=True)  # May be from request, not persisted in actions table
+    action_type = Column(String(50), nullable=False)
+    action_payload = Column(JSONB, nullable=False)
+
+    # Simulation outputs
+    predicted_outcomes = Column(JSONB, nullable=False)
+    confidence_in_prediction = Column(Float, nullable=False)
+    side_effects = Column(JSONB, nullable=False)
+    alternative_outcomes = Column(JSONB, nullable=False)
+    comparison_to_alternatives = Column(JSONB, nullable=False)
+    ranked_alternatives = Column(JSONB, nullable=False)
+
+    # Approval tracking
+    approval_id = Column(UUID(as_uuid=True), ForeignKey('approvals.approval_id'))
+    approved = Column(Boolean, default=False)
+
+    # Metadata
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        Index('idx_sim_incident', 'incident_id'),
+        Index('idx_sim_action_type', 'action_type'),
+        Index('idx_sim_created_at', 'created_at'),
+    )
+
+
 class MerchantProfileDB(Base):
     """
     Merchant context for event enrichment.
@@ -396,4 +431,47 @@ class KnownPatternDB(Base):
     __table_args__ = (
         UniqueConstraint('signature', 'successful_action_type', name='uq_signature_action'),
         Index('idx_signature_pattern', 'signature'),
+    )
+
+
+class PolicyThresholdDB(Base):
+    """
+    Dynamic policy thresholds learned from human approver patterns (Agent 7 & 9: Learning).
+    Tracks approval policies and their evolution based on human decisions.
+    
+    Enables the system to learn:
+    - "Approvers trust high-confidence escalations → auto-approve these"
+    - "Approvers reject low-confidence comms → require human review"
+    - "Approvers fast-track critical incidents → adjust escalation threshold"
+    """
+    __tablename__ = "policy_thresholds"
+
+    threshold_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    # Policy identification
+    policy_name = Column(String(100), nullable=False)  # e.g., "escalation_confidence_threshold"
+    applies_to = Column(String(50), nullable=False)  # e.g., "escalate_eng", "proactive_comms"
+    
+    # Threshold values
+    current_value = Column(Float, nullable=False)  # Current threshold (e.g., 0.6)
+    previous_value = Column(Float)  # Previous threshold for comparison
+    
+    # Learning metadata
+    based_on_n_approvals = Column(Integer, default=0)  # How many approvals informed this?
+    approval_rate = Column(Float)  # Approval rate at this threshold
+    rejection_rate = Column(Float)  # Rejection rate at this threshold
+    
+    # Audit trail
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    update_reason = Column(Text)  # Why was it updated? e.g., "Approvers rejected 80% of <0.5 confidence actions"
+    updated_by = Column(String(100), default='system')  # Who/what updated it
+    
+    # Statistical confidence
+    confidence_in_change = Column(Float)  # How confident in this update? (0-1)
+    sample_size = Column(Integer)  # Sample size for statistical validity
+
+    __table_args__ = (
+        UniqueConstraint('policy_name', 'applies_to', name='uq_policy_applies_to'),
+        Index('idx_policy_applies', 'applies_to'),
+        Index('idx_updated_at', 'updated_at'),
     )

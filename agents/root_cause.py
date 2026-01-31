@@ -1,7 +1,7 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from models.incidents import Incident
-from models.hypotheses import Hypothesis, RootCauseAnalysis
+from models.hypotheses import Hypothesis, RootCauseAnalysis, AlternativeHypothesis
 from db.models import IncidentDB, IncidentHypothesisDB, CleanEventDB, IncidentClusterDB
 from tools.llm_router import LLMRouter
 from tools.knowledge_base import KnowledgeBase
@@ -72,14 +72,15 @@ class RootCauseAnalystAgent:
         2. Retrieve similar past incidents via RAG
         3. Retrieve relevant documentation via RAG
         4. Generate hypotheses using LLM + RAG context
-        5. Store hypotheses in database
+        5. [Priority 6] Generate opposing hypotheses for intellectual debate
+        6. Store hypotheses in database
         
         Args:
             incident: Incident to analyze
             db: SQLAlchemy session
         
         Returns:
-            RootCauseAnalysis with ranked hypotheses
+            RootCauseAnalysis with ranked hypotheses and alternative explanations
         """
         logger.info(f"[RootCauseAnalystAgent] Analyzing incident: {incident.title}")
         
@@ -108,7 +109,23 @@ class RootCauseAnalystAgent:
         )
         logger.info(f"[RootCauseAnalystAgent] Generated {len(hypotheses)} hypotheses")
         
-        # Step 5: Store hypotheses in database
+        # Step 5: [Priority 6] Generate opposing hypotheses for intellectual debate
+        logger.debug("[RootCauseAnalystAgent] Generating opposing hypotheses...")
+        alternatives = self.generate_opposing_hypotheses(
+            primary_hypotheses=hypotheses,
+            incident=incident,
+            evidence_bundle=evidence_bundle,
+            db=db
+        )
+        logger.info(f"[RootCauseAnalystAgent] Generated {len(alternatives)} alternative explanations")
+        
+        # Generate debate summary
+        debate_summary = None
+        if hypotheses and alternatives:
+            debate_summary = self.generate_debate_summary(hypotheses[0], alternatives)
+            logger.debug("[RootCauseAnalystAgent] Generated debate summary")
+        
+        # Step 6: Store hypotheses in database
         self._store_hypotheses(hypotheses, incident.incident_id, db)
         
         # Create analysis result
@@ -116,11 +133,16 @@ class RootCauseAnalystAgent:
             incident_id=incident.incident_id,
             analysis_timestamp=datetime.utcnow(),
             hypotheses=hypotheses,
+            alternative_explanations=alternatives,
+            debate_summary=debate_summary,
             recommended_next_steps=self._generate_next_steps(hypotheses, incident),
             rag_sources_used=len(past_incidents) + len(relevant_docs)
         )
         
-        logger.info(f"[RootCauseAnalystAgent] Analysis complete: {len(analysis.hypotheses)} hypotheses, {analysis.rag_sources_used} RAG sources")
+        logger.info(
+            f"[RootCauseAnalystAgent] Analysis complete: {len(analysis.hypotheses)} hypotheses, "
+            f"{len(analysis.alternative_explanations)} alternatives, {analysis.rag_sources_used} RAG sources"
+        )
         return analysis
     
     def _gather_evidence(self, incident: Incident, db: Session) -> dict:
@@ -500,6 +522,350 @@ Return hypotheses ranked by confidence (highest first).
         
         return steps
     
+    def refine_hypotheses_with_evidence(
+        self,
+        hypotheses: List[Hypothesis],
+        new_evidence: Dict[str, Any],
+        db: Session
+    ) -> List[Hypothesis]:
+        """
+        Update hypothesis confidences using Bayesian updating.
+        
+        Implements Bayes' Rule: P(H|E) = P(E|H) * P(H) / P(E)
+        
+        This is the key to showing adaptive reasoning - confidence scores
+        update as new evidence arrives, not static from LLM generation.
+        
+        Args:
+            hypotheses: Current hypotheses with prior confidence scores
+            new_evidence: New evidence from RAG, logs, feedback, stage analysis
+            db: SQLAlchemy session for data access
+        
+        Returns:
+            Updated hypotheses with posterior confidence scores, sorted by confidence
+        
+        Example:
+            Initial: migration_misstep (0.74), platform_regression (0.26)
+            
+            Evidence: Similar past incidents (3 cases of migration_misstep)
+            - Likelihood for migration_misstep: 0.8 (matches 100% of cases)
+            - Likelihood for platform_regression: 0.3 (matches 0% of cases)
+            
+            Updated:
+            - migration_misstep: 0.8 * 0.74 / total = 0.85 (increased)
+            - platform_regression: 0.3 * 0.26 / total = 0.15 (decreased)
+        """
+        print("[Root Cause] Refining hypotheses with Bayesian updating...")
+        
+        # Step 1: Calculate likelihood for each hypothesis
+        # Likelihood = P(E|H): How likely is this evidence if the hypothesis is true?
+        likelihoods = {}
+        for hypothesis in hypotheses:
+            likelihood = self._calculate_likelihood(hypothesis, new_evidence)
+            likelihoods[hypothesis.hypothesis_id] = likelihood
+            print(f"  Likelihood P(E|H) for {hypothesis.type}: {likelihood:.3f}")
+        
+        # Step 2: Calculate unnormalized posteriors
+        # Unnormalized posterior = Likelihood * Prior
+        # Prior = existing confidence
+        refined = []
+        unnormalized_posteriors = {}
+        
+        for hypothesis in hypotheses:
+            prior = hypothesis.confidence
+            likelihood = likelihoods[hypothesis.hypothesis_id]
+            
+            # Bayes' rule (unnormalized): P(H|E) ∝ P(E|H) * P(H)
+            unnormalized_posterior = likelihood * prior
+            unnormalized_posteriors[hypothesis.hypothesis_id] = unnormalized_posterior
+            
+            print(f"  Unnormalized posterior for {hypothesis.type}: {unnormalized_posterior:.4f}")
+        
+        # Step 3: Normalize to ensure probabilities sum to 1.0
+        # This ensures P(E) normalization across all hypotheses
+        total_posterior = sum(unnormalized_posteriors.values())
+        
+        for hypothesis in hypotheses:
+            # Create updated copy
+            updated_hypothesis = hypothesis.copy(deep=True)
+            
+            # Calculate normalized posterior
+            if total_posterior > 0:
+                posterior_confidence = unnormalized_posteriors[hypothesis.hypothesis_id] / total_posterior
+            else:
+                posterior_confidence = 1.0 / len(hypotheses)  # Uniform if all zero
+            
+            # Update confidence
+            old_confidence = updated_hypothesis.confidence
+            updated_hypothesis.confidence = round(posterior_confidence, 3)
+            
+            # Step 4: Update evidence lists based on likelihood
+            if likelihoods[hypothesis.hypothesis_id] > 0.6:
+                # Evidence supports this hypothesis
+                supporting_evidence = self._extract_supporting_evidence(hypothesis, new_evidence)
+                updated_hypothesis.evidence.extend(supporting_evidence)
+                print(f"  ✓ Evidence supports {hypothesis.type}: +{len(supporting_evidence)} items")
+            
+            elif likelihoods[hypothesis.hypothesis_id] < 0.4:
+                # Evidence contradicts this hypothesis
+                contradicting_evidence = self._extract_contradicting_evidence(hypothesis, new_evidence)
+                updated_hypothesis.counterevidence.extend(contradicting_evidence)
+                print(f"  ✗ Evidence contradicts {hypothesis.type}: +{len(contradicting_evidence)} items")
+            
+            refined.append(updated_hypothesis)
+            
+            # Print confidence change
+            confidence_change = updated_hypothesis.confidence - old_confidence
+            direction = "↑" if confidence_change > 0 else "↓" if confidence_change < 0 else "→"
+            print(f"  {direction} {hypothesis.type}: {old_confidence:.3f} → {updated_hypothesis.confidence:.3f} ({confidence_change:+.3f})")
+        
+        # Step 5: Re-sort by confidence (highest first)
+        refined.sort(key=lambda h: h.confidence, reverse=True)
+        
+        print(f"[Root Cause] Hypothesis refinement complete. Final ranking:")
+        for i, h in enumerate(refined, 1):
+            print(f"  {i}. {h.type}: {h.confidence:.3f} ({len(h.evidence)} evidence items)")
+        
+        return refined
+    
+    def _calculate_likelihood(
+        self,
+        hypothesis: Hypothesis,
+        evidence: Dict[str, Any]
+    ) -> float:
+        """
+        Calculate P(E|H): likelihood of evidence given hypothesis.
+        
+        This is the core Bayesian component - how likely is this evidence
+        if the hypothesis were true?
+        
+        Args:
+            hypothesis: Hypothesis to evaluate
+            evidence: New evidence to assess
+        
+        Returns:
+            Likelihood score from 0.0 to 1.0
+        """
+        likelihood = 0.5  # Neutral baseline
+        
+        evidence_type = evidence.get("type", "")
+        
+        # ===== RAG Retrieval Evidence =====
+        # Evidence from similar past incidents
+        if evidence_type == "rag_retrieval":
+            similar_incidents = evidence.get("similar_incidents", [])
+            
+            if similar_incidents:
+                # Count how many past incidents had the same root cause
+                matching_causes = sum(
+                    1 for incident in similar_incidents
+                    if incident.get("root_cause") == hypothesis.type
+                )
+                
+                # Match rate: what fraction of similar incidents had this cause?
+                match_rate = matching_causes / len(similar_incidents) if similar_incidents else 0
+                
+                # Likelihood = 0.3 + (match_rate * 0.5)
+                # If 100% match: 0.3 + 0.5 = 0.8 (strong evidence)
+                # If 0% match: 0.3 (weak evidence, but not impossible)
+                likelihood = 0.3 + (match_rate * 0.5)
+                logger.debug(
+                    f"[Bayesian] RAG evidence for {hypothesis.type}: "
+                    f"{matching_causes}/{len(similar_incidents)} similar incidents, "
+                    f"likelihood={likelihood:.3f}"
+                )
+        
+        # ===== Log Analysis Evidence =====
+        # Evidence from system logs and diagnostics
+        elif evidence_type == "log_analysis":
+            log_findings = evidence.get("findings", [])
+            
+            if hypothesis.type == "platform_regression":
+                # For regression hypothesis, look for deployment/release evidence
+                regex_patterns = [r"deployment", r"release", r"push", r"update", r"version"]
+                matching_findings = sum(
+                    1 for finding in log_findings
+                    if any(re.search(pattern, finding.lower()) for pattern in regex_patterns)
+                )
+                
+                likelihood = 0.8 if matching_findings > 0 else 0.3
+                logger.debug(
+                    f"[Bayesian] Log analysis for platform_regression: "
+                    f"{matching_findings} deployment-related findings, likelihood={likelihood:.3f}"
+                )
+            
+            elif hypothesis.type == "merchant_config":
+                # For config hypothesis, look for configuration errors
+                config_keywords = [r"config", r"setup", r"initialization", r"parameter", r"setting"]
+                matching_findings = sum(
+                    1 for finding in log_findings
+                    if any(re.search(pattern, finding.lower()) for pattern in config_keywords)
+                )
+                
+                likelihood = 0.8 if matching_findings > 0 else 0.4
+                logger.debug(
+                    f"[Bayesian] Log analysis for merchant_config: "
+                    f"{matching_findings} config-related findings, likelihood={likelihood:.3f}"
+                )
+        
+        # ===== Merchant Feedback Evidence =====
+        # Evidence from merchant reports and feedback
+        elif evidence_type == "merchant_feedback":
+            feedback_text = evidence.get("feedback", "").lower()
+            
+            if hypothesis.type == "docs_gap":
+                # For docs gap, look for confusion/clarity keywords
+                clarity_keywords = ["unclear", "confusing", "documentation", "how do i", "not clear", "missing"]
+                keyword_matches = sum(
+                    1 for keyword in clarity_keywords
+                    if keyword in feedback_text
+                )
+                
+                likelihood = 0.9 if keyword_matches > 0 else 0.3
+                logger.debug(
+                    f"[Bayesian] Merchant feedback for docs_gap: "
+                    f"{keyword_matches} clarity keywords, likelihood={likelihood:.3f}"
+                )
+            
+            elif hypothesis.type == "migration_misstep":
+                # For migration issue, look for process/step-related keywords
+                migration_keywords = ["migration", "stage", "step", "missed", "skipped", "forgot"]
+                keyword_matches = sum(
+                    1 for keyword in migration_keywords
+                    if keyword in feedback_text
+                )
+                
+                likelihood = 0.85 if keyword_matches > 0 else 0.4
+                logger.debug(
+                    f"[Bayesian] Merchant feedback for migration_misstep: "
+                    f"{keyword_matches} migration keywords, likelihood={likelihood:.3f}"
+                )
+        
+        # ===== Stage Analysis Evidence =====
+        # Evidence from stage concentration patterns
+        elif evidence_type == "stage_analysis":
+            stage_concentration = evidence.get("stage_concentration", {})
+            dominant_stage = evidence.get("dominant_stage")
+            
+            if stage_concentration and dominant_stage:
+                # Get concentration percentage for dominant stage
+                stage_pct = stage_concentration.get(str(dominant_stage), 0)
+                
+                if hypothesis.type == "migration_misstep":
+                    # Migration issues often concentrate in one stage
+                    # High concentration (>70%) suggests stage-specific problem
+                    likelihood = 0.85 if stage_pct > 0.7 else 0.5
+                    logger.debug(
+                        f"[Bayesian] Stage analysis for migration_misstep: "
+                        f"Stage {dominant_stage} = {stage_pct*100:.0f}%, likelihood={likelihood:.3f}"
+                    )
+        
+        return max(0.0, min(1.0, likelihood))  # Clamp to [0, 1]
+    
+    def _extract_supporting_evidence(
+        self,
+        hypothesis: Hypothesis,
+        evidence: Dict[str, Any]
+    ) -> List[str]:
+        """
+        Extract specific supporting evidence statements.
+        
+        Adds new evidence to hypothesis.evidence list when evidence
+        supports the hypothesis.
+        
+        Args:
+            hypothesis: Hypothesis being evaluated
+            evidence: Evidence bundle
+        
+        Returns:
+            List of supporting evidence statements to add
+        """
+        supporting = []
+        evidence_type = evidence.get("type", "")
+        
+        if evidence_type == "rag_retrieval":
+            similar_incidents = evidence.get("similar_incidents", [])
+            matching_count = sum(
+                1 for inc in similar_incidents
+                if inc.get("root_cause") == hypothesis.type
+            )
+            
+            if matching_count > 0:
+                supporting.append(
+                    f"Found {matching_count}/{len(similar_incidents)} similar past incidents "
+                    f"with root cause: {hypothesis.type}"
+                )
+        
+        elif evidence_type == "log_analysis":
+            findings = evidence.get("findings", [])
+            if findings:
+                supporting.append(f"Log analysis findings: {findings[0]}")
+                if len(findings) > 1:
+                    supporting.append(f"Additional log finding: {findings[1]}")
+        
+        elif evidence_type == "merchant_feedback":
+            feedback_summary = evidence.get("summary", "")
+            if feedback_summary:
+                supporting.append(f"Merchant feedback confirms: {feedback_summary}")
+        
+        elif evidence_type == "stage_analysis":
+            dominant_stage = evidence.get("dominant_stage")
+            concentration_pct = evidence.get("stage_concentration", {}).get(str(dominant_stage), 0)
+            
+            if dominant_stage and concentration_pct > 0.7:
+                supporting.append(
+                    f"High concentration ({concentration_pct*100:.0f}%) in Stage {dominant_stage} "
+                    f"suggests stage-specific issue"
+                )
+        
+        return supporting
+    
+    def _extract_contradicting_evidence(
+        self,
+        hypothesis: Hypothesis,
+        evidence: Dict[str, Any]
+    ) -> List[str]:
+        """
+        Extract evidence that contradicts hypothesis.
+        
+        Adds counterevidence to hypothesis.counterevidence list when
+        evidence does NOT support the hypothesis.
+        
+        Args:
+            hypothesis: Hypothesis being evaluated
+            evidence: Evidence bundle
+        
+        Returns:
+            List of contradicting evidence statements to add
+        """
+        contradicting = []
+        evidence_type = evidence.get("type", "")
+        
+        if evidence_type == "log_analysis":
+            findings = evidence.get("findings", [])
+            if findings and not any(
+                hypothesis.type.lower() in finding.lower()
+                for finding in findings
+            ):
+                contradicting.append(
+                    f"Log analysis did not find patterns expected for {hypothesis.type}: "
+                    f"{findings[0] if findings else 'no relevant findings'}"
+                )
+        
+        elif evidence_type == "stage_analysis":
+            # If evidence shows dispersed errors across stages,
+            # contradicts migration_misstep hypothesis (which predicts stage concentration)
+            stage_concentration = evidence.get("stage_concentration", {})
+            max_concentration = max(stage_concentration.values()) if stage_concentration else 0
+            
+            if hypothesis.type == "migration_misstep" and max_concentration < 0.5:
+                contradicting.append(
+                    f"Errors dispersed across stages (max concentration {max_concentration*100:.0f}%) "
+                    f"contradicts stage-specific migration issue"
+                )
+        
+        return contradicting
+    
     def _store_hypotheses(self, hypotheses: List[Hypothesis], incident_id: str, db: Session):
         """
         Store hypotheses in database.
@@ -526,3 +892,209 @@ Return hypotheses ranked by confidence (highest first).
         
         db.commit()
         logger.info(f"[RootCauseAnalystAgent] Stored {len(hypotheses)} hypotheses for incident {incident_id}")
+
+    def generate_opposing_hypotheses(
+        self,
+        primary_hypotheses: List[Hypothesis],
+        incident: Incident,
+        evidence_bundle: Dict[str, Any],
+        db: Session
+    ) -> List[AlternativeHypothesis]:
+        """
+        Generate counter-hypotheses to challenge primary explanations.
+        
+        Priority 6 Enhancement: Multi-Agent Debate / Intellectual Humility
+        
+        For the top 2 primary hypotheses, intentionally generates opposing
+        hypotheses that challenge our assumptions. This forces more rigorous
+        reasoning through adversarial thinking.
+        
+        Questions asked:
+        - "What if we're WRONG about the primary hypothesis?"
+        - "What alternative explanation could fit the same data?"
+        - "What evidence are we overlooking that contradicts our theory?"
+        
+        Args:
+            primary_hypotheses: Top hypotheses from initial analysis
+            incident: The incident being analyzed
+            evidence_bundle: Evidence gathered during analysis
+            db: Database session
+        
+        Returns:
+            List of AlternativeHypothesis objects with plausibility scores
+        """
+        logger.info("[RootCauseAnalystAgent] Generating opposing hypotheses for intellectual debate...")
+        
+        # Take top 2 primary hypotheses to challenge
+        hypotheses_to_challenge = primary_hypotheses[:2]
+        alternatives = []
+        
+        for primary in hypotheses_to_challenge:
+            logger.debug(f"[RootCauseAnalystAgent] Challenging hypothesis: {primary.type} ({primary.confidence:.2f})")
+            
+            # Build adversarial prompt
+            prompt = self._build_adversarial_prompt(primary, incident, evidence_bundle)
+            
+            try:
+                # Get LLM to generate counter-hypotheses
+                response = self.llm.generate(
+                    prompt=prompt,
+                    model="gpt-4o",  # Use most capable model for nuanced reasoning
+                    temperature=0.8,  # Higher temperature for creative alternatives
+                    response_model=AlternativeHypothesesResponse
+                )
+                
+                # Parse alternatives
+                for alt_response in response.alternatives:
+                    alternative = AlternativeHypothesis(
+                        alternative_id=uuid4(),
+                        type=alt_response.type,
+                        claim=alt_response.claim,
+                        plausibility=alt_response.plausibility,
+                        contradicting_evidence=alt_response.contradicting_evidence,
+                        explanatory_power=alt_response.explanatory_power,
+                        why_we_might_be_wrong=alt_response.why_we_might_be_wrong,
+                        why_primary_is_stronger=alt_response.why_primary_is_stronger,
+                        what_would_prove_this=alt_response.what_would_prove_this
+                    )
+                    alternatives.append(alternative)
+                    
+                    logger.info(
+                        f"[RootCauseAnalystAgent] Generated alternative: {alternative.type} "
+                        f"(plausibility: {alternative.plausibility:.2f})"
+                    )
+            
+            except Exception as e:
+                logger.error(f"[RootCauseAnalystAgent] Failed to generate alternatives for {primary.type}: {e}")
+                continue
+        
+        logger.info(f"[RootCauseAnalystAgent] Generated {len(alternatives)} alternative explanations")
+        return alternatives
+    
+    def _build_adversarial_prompt(
+        self,
+        primary_hypothesis: Hypothesis,
+        incident: Incident,
+        evidence_bundle: Dict[str, Any]
+    ) -> str:
+        """Build prompt for generating counter-hypotheses."""
+        
+        # Format evidence
+        evidence_str = "\n".join(f"- {e}" for e in evidence_bundle.get("observations", []))
+        sample_events = evidence_bundle.get("sample_events", [])[:3]
+        events_str = "\n".join(
+            f"- Merchant {e.get('merchant_id')}: {e.get('error_type')} at {e.get('timestamp')}"
+            for e in sample_events
+        )
+        
+        prompt = f"""You are a critical analyst tasked with challenging a proposed root cause hypothesis.
+
+**INCIDENT DETAILS:**
+Title: {incident.title}
+Severity: {incident.severity}
+Affected merchants: {incident.blast_radius_estimate}
+Stage distribution: {json.dumps(evidence_bundle.get('stage_distribution', {}))}
+
+**CURRENT PRIMARY HYPOTHESIS:**
+Type: {primary_hypothesis.type}
+Claim: {primary_hypothesis.claim}
+Confidence: {primary_hypothesis.confidence:.2f}
+
+Evidence supporting primary:
+{chr(10).join(f"  - {e}" for e in primary_hypothesis.evidence)}
+
+**YOUR TASK: Challenge this hypothesis**
+
+Generate 1-2 ALTERNATIVE explanations that could fit the same data.
+
+Questions to explore:
+1. What if we're WRONG about "{primary_hypothesis.type}"?
+2. What alternative root cause type could explain these observations?
+3. What evidence are we overlooking that contradicts our primary theory?
+4. Could the data be misleading us in a systematic way?
+
+**AVAILABLE EVIDENCE TO REINTERPRET:**
+{evidence_str}
+
+**SAMPLE EVENTS:**
+{events_str}
+
+**ALTERNATIVE HYPOTHESIS TYPES:**
+- merchant_config: Merchants misconfigured something
+- migration_misstep: Migration process/documentation issue
+- platform_regression: Platform bug or code regression
+- docs_gap: Documentation unclear or missing
+
+For each alternative, provide:
+1. **type**: One of the 4 types above (must be DIFFERENT from primary)
+2. **claim**: Clear counter-claim challenging the primary
+3. **plausibility**: Score 0.0-1.0 (typically lower than primary's {primary_hypothesis.confidence:.2f})
+4. **contradicting_evidence**: Evidence from same data supporting this alternative
+5. **explanatory_power**: How well this explains the observations
+6. **why_we_might_be_wrong**: Reasoning about how primary could be incorrect
+7. **why_primary_is_stronger**: Why primary is still more likely (be fair)
+8. **what_would_prove_this**: Evidence that would validate this alternative
+
+Be intellectually honest - generate plausible alternatives that force rigorous thinking.
+"""
+        
+        return prompt
+    
+    def generate_debate_summary(
+        self,
+        primary_hypothesis: Hypothesis,
+        alternatives: List[AlternativeHypothesis]
+    ) -> str:
+        """Generate summary of why primary was chosen over alternatives."""
+        
+        if not alternatives:
+            return f"No significant alternatives identified. Primary hypothesis ({primary_hypothesis.type}) at {primary_hypothesis.confidence:.2f} confidence is clearly strongest."
+        
+        summary_parts = [
+            f"**Primary Hypothesis:** {primary_hypothesis.type} ({primary_hypothesis.confidence:.2f} confidence)",
+            f"**Claim:** {primary_hypothesis.claim}",
+            "",
+            "**Alternatives Considered:**"
+        ]
+        
+        for idx, alt in enumerate(alternatives, 1):
+            summary_parts.extend([
+                f"{idx}. **{alt.type}** ({alt.plausibility:.2f} plausibility)",
+                f"   Claim: {alt.claim}",
+                f"   Why we might be wrong: {alt.why_we_might_be_wrong[:150]}...",
+                f"   Why primary is stronger: {alt.why_primary_is_stronger[:150]}...",
+                ""
+            ])
+        
+        summary_parts.extend([
+            "**Decision:**",
+            f"Primary hypothesis ({primary_hypothesis.type}) remains most likely due to:",
+            f"- Higher confidence score ({primary_hypothesis.confidence:.2f} vs {max(a.plausibility for a in alternatives):.2f})",
+            f"- Stronger evidence alignment",
+            f"- Better explanatory power for all observations",
+            "",
+            "However, alternatives have been documented for transparency and should be revisited if primary validation fails."
+        ])
+        
+        return "\n".join(summary_parts)
+
+
+# Pydantic models for adversarial LLM response parsing
+class AlternativeHypothesisResponse(BaseModel):
+    """Structured alternative hypothesis from LLM."""
+    type: str = Field(description="Type: merchant_config, migration_misstep, platform_regression, or docs_gap")
+    claim: str = Field(description="Counter-claim challenging the primary hypothesis")
+    plausibility: float = Field(description="Plausibility score 0.0-1.0")
+    contradicting_evidence: List[str] = Field(description="Evidence supporting this alternative")
+    explanatory_power: str = Field(description="How well this explains the observations")
+    why_we_might_be_wrong: str = Field(description="Why the primary hypothesis could be incorrect")
+    why_primary_is_stronger: str = Field(description="Why primary is still more likely")
+    what_would_prove_this: List[str] = Field(description="Evidence that would validate this")
+
+
+class AlternativeHypothesesResponse(BaseModel):
+    """Structured response containing alternative hypotheses."""
+    alternatives: List[AlternativeHypothesisResponse] = Field(
+        description="1-2 alternative explanations challenging the primary"
+    )
+
