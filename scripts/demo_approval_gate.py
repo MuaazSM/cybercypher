@@ -260,7 +260,7 @@ def demo_approval_gate():
         db.close()
 
 
-def Action_from_db(action_db) -> 'Action':
+def Action_from_db(action_db) -> 'Action':      #type: ignore
     """Convert ActionDB to Action Pydantic model."""
     from models.actions import Action
     
