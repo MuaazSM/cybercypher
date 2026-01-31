@@ -1,14 +1,9 @@
-"""
-Database Seeding Script - Pre-populates with mock data.
-
-Creates:
-- 100 merchant profiles (for enrichment)
-- 700 historical events (7 days of background + spike)
-- Spike scenario (50 concentrated webhook failures)
-"""
-
 from db.database import SessionLocal
-from db.models import RawEventDB, MerchantProfileDB
+from db.models import (
+    RawEventDB, MerchantProfileDB, CleanEventDB, IncidentClusterDB,
+    IncidentDB, IncidentHypothesisDB, ActionPlanDB, ActionDB, ApprovalDB,
+    ExecutedActionDB, ActionOutcomeDB, KnownPatternDB
+)
 from simulator.event_generator import EventSimulator
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -128,6 +123,24 @@ def seed_database():
     db = SessionLocal()
     
     try:
+        # 0. Clear existing data for clean seed (respecting foreign keys)
+        print("\n[0/3] Clearing existing data...")
+        # Delete in reverse dependency order
+        db.query(ActionOutcomeDB).delete()
+        db.query(ExecutedActionDB).delete()
+        db.query(ApprovalDB).delete()
+        db.query(ActionDB).delete()
+        db.query(ActionPlanDB).delete()
+        db.query(IncidentHypothesisDB).delete()
+        db.query(IncidentDB).delete()
+        db.query(IncidentClusterDB).delete()
+        db.query(CleanEventDB).delete()
+        db.query(RawEventDB).delete()
+        db.query(KnownPatternDB).delete()
+        db.query(MerchantProfileDB).delete()
+        db.commit()
+        logger.info("✓ Cleared all existing data")
+        
         # 1. Create merchant profiles
         print("\n[1/3] Creating 100 merchant profiles...")
         merchants = create_merchant_profiles()

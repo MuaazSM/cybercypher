@@ -1,13 +1,3 @@
-"""
-Demo Data Flow - Complete end-to-end demonstration.
-
-Shows:
-1. Generating spike scenario
-2. Agent 1: Ingesting raw events
-3. Agent 2: Normalizing to clean events
-4. Agent 3: Detecting incident patterns
-"""
-
 from simulator.event_generator import EventSimulator
 from agents.ingestion import SignalIngestionAgent
 from agents.normalization import NormalizationAgent
