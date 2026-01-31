@@ -1,10 +1,3 @@
-"""
-Pydantic models for events in the Agentic Self-Healing Support System.
-
-These models define the data contracts for events as they flow through
-the Observe pipeline (Agents 1-3).
-"""
-
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal, Optional, Dict, Any
 from datetime import datetime
