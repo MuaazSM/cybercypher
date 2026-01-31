@@ -2,6 +2,14 @@ from typing import Optional, Any, Type, List
 from dataclasses import dataclass
 import os
 import logging
+
+# Load .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, rely on env vars
+
 from openai import OpenAI
 from groq import Groq
 import google.generativeai as genai
