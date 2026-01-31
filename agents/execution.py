@@ -5,56 +5,13 @@ from sqlalchemy.orm import Session
 from uuid import uuid4
 from datetime import datetime
 
-from models.actions import Action
+from models.actions import Action, ExecutedAction
 from db.models import ActionDB, ExecutedActionDB
 from tools.slack_client import SlackClient
 from tools.github_client import GitHubClient
 from tools.llm_router import LLMRouter
 
 logger = logging.getLogger(__name__)
-
-
-class ExecutedAction:
-    """Represents an executed action with audit trail"""
-    def __init__(
-        self,
-        execution_id: str,
-        action_id: str,
-        executed_at: datetime,
-        executed_by: str,
-        success: bool,
-        execution_log: str,
-        external_references: Dict[str, Any],
-        error_message: Optional[str] = None,
-        retry_count: int = 0,
-        action_payload_snapshot: Optional[Dict] = None
-    ):
-        self.execution_id = execution_id
-        self.action_id = action_id
-        self.executed_at = executed_at
-        self.executed_by = executed_by
-        self.success = success
-        self.execution_log = execution_log
-        self.external_references = external_references
-        self.error_message = error_message
-        self.retry_count = retry_count
-        self.action_payload_snapshot = action_payload_snapshot or {}
-    
-    def model_dump(self, exclude=None):
-        """Serialize to dict for database storage"""
-        exclude = exclude or set()
-        return {
-            "execution_id": self.execution_id,
-            "action_id": self.action_id,
-            "executed_at": self.executed_at,
-            "executed_by": self.executed_by,
-            "success": self.success,
-            "execution_log": self.execution_log,
-            "external_references": self.external_references if "external_references" not in exclude else None,
-            "error_message": self.error_message,
-            "retry_count": self.retry_count,
-            "action_payload_snapshot": self.action_payload_snapshot if "action_payload_snapshot" not in exclude else None
-        }
 
 
 class ExecutionAgent:

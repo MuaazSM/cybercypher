@@ -122,3 +122,45 @@ class Approval(BaseModel):
             }
         }
     )
+
+
+class ExecutedAction(BaseModel):
+    """
+    Record of an executed action with audit trail.
+    
+    Tracks action execution results including:
+    - External references (GitHub issues, Slack messages, etc)
+    - Execution logs and error messages
+    - Retry information
+    """
+    
+    execution_id: UUID = Field(default_factory=uuid4, description="Unique execution ID")
+    action_id: UUID = Field(description="Associated action")
+    executed_at: datetime = Field(default_factory=datetime.utcnow, description="When action was executed")
+    executed_by: str = Field(description="Who executed (system or user)")
+    success: bool = Field(description="Whether execution succeeded")
+    execution_log: str = Field(description="Execution log output")
+    external_references: Dict[str, Any] = Field(description="External system references")
+    error_message: Optional[str] = Field(default=None, description="Error message if failed")
+    retry_count: int = Field(default=0, description="Number of retries")
+    action_payload_snapshot: Dict[str, Any] = Field(description="Snapshot of action payload at execution time")
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "execution_id": "e50e8400-e29b-41d4-a716-446655440034",
+                "action_id": "850e8400-e29b-41d4-a716-446655440031",
+                "executed_at": "2026-01-31T11:00:00Z",
+                "executed_by": "system",
+                "success": True,
+                "execution_log": "Created GitHub issue #123",
+                "external_references": {
+                    "github_issue": 123,
+                    "github_url": "https://github.com/org/repo/issues/123"
+                },
+                "error_message": None,
+                "retry_count": 0,
+                "action_payload_snapshot": {}
+            }
+        }
+    )

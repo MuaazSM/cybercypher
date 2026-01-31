@@ -4,7 +4,7 @@ from datetime import datetime
 from langgraph.graph import StateGraph, END
 
 from graph.state import AgentState
-from db.database import get_db
+from db.database import SessionLocal
 
 
 class AgenticWorkflow:
@@ -51,7 +51,8 @@ class AgenticWorkflow:
         """Observe pipeline: ingest → normalize → detect patterns"""
         print("[Graph] OBSERVE stage")
 
-        with get_db() as db:
+        db = SessionLocal()
+        try:
             # Normalization
             self.agents["normalization"].process_raw_events(db, limit=200)
 
@@ -60,6 +61,8 @@ class AgenticWorkflow:
 
             state["clusters"] = clusters
             state["current_stage"] = "observe"
+        finally:
+            db.close()
 
         return state
 
@@ -70,7 +73,8 @@ class AgenticWorkflow:
         incidents = []
         analyses = []
 
-        with get_db() as db:
+        db = SessionLocal()
+        try:
             for cluster in state.get("clusters", []):
                 # Triage
                 incident = self.agents["triage"].triage_cluster(cluster, db)
@@ -81,6 +85,8 @@ class AgenticWorkflow:
                     # Root cause analysis
                     analysis = self.agents["root_cause"].analyze_root_cause(incident, db)
                     analyses.append(analysis)
+        finally:
+            db.close()
 
         state["incidents"] = incidents
         state["analyses"] = analyses
@@ -94,10 +100,13 @@ class AgenticWorkflow:
 
         action_plans = []
 
-        with get_db() as db:
+        db = SessionLocal()
+        try:
             for incident, analysis in zip(state.get("incidents", []), state.get("analyses", [])):
                 plan = self.agents["planner"].plan_actions(incident, analysis, db)
                 action_plans.append(plan)
+        finally:
+            db.close()
 
         state["action_plans"] = action_plans
         state["current_stage"] = "decide"
@@ -111,7 +120,8 @@ class AgenticWorkflow:
         approvals = []
         requires_human = False
 
-        with get_db() as db:
+        db = SessionLocal()
+        try:
             for plan in state.get("action_plans", []):
                 for action in plan.actions:
                     # Get incident severity
@@ -128,6 +138,8 @@ class AgenticWorkflow:
 
                     if approval.status == "pending":
                         requires_human = True
+        finally:
+            db.close()
 
         state["approvals"] = approvals
         state["requires_human_approval"] = requires_human
@@ -159,7 +171,8 @@ class AgenticWorkflow:
 
         executed = []
 
-        with get_db() as db:
+        db = SessionLocal()
+        try:
             for plan in state.get("action_plans", []):
                 for action in plan.actions:
                     approval = next(
@@ -174,6 +187,8 @@ class AgenticWorkflow:
                         except Exception as e:
                             print(f"[Graph] Execution failed: {e}")
                             state.setdefault("errors", []).append(str(e))
+        finally:
+            db.close()
 
         state["executed_actions"] = executed
         state["current_stage"] = "act"
@@ -186,7 +201,8 @@ class AgenticWorkflow:
 
         outcomes = []
 
-        with get_db() as db:
+        db = SessionLocal()
+        try:
             for executed_action in state.get("executed_actions", []):
                 try:
                     outcome = self.agents["feedback"].measure_outcome(
@@ -196,6 +212,8 @@ class AgenticWorkflow:
                 except Exception as e:
                     print(f"[Graph] Outcome measurement failed: {e}")
                     state.setdefault("errors", []).append(str(e))
+        finally:
+            db.close()
 
         state["outcomes"] = outcomes
         state["current_stage"] = "learn"
