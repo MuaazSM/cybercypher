@@ -138,7 +138,7 @@ def pending_approvals(db: Session = Depends(get_db)):
 
 
 @app.post("/approvals/{approval_id}/approve")
-def approve_action(approval_id: str, approver: str, db: Session = Depends(get_db)):
+def approve_action(approval_id: str, db: Session = Depends(get_db), approver: str = "dashboard-user"):
     """Manually approve an action"""
     from uuid import UUID
 
