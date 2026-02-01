@@ -76,6 +76,19 @@ Executes approved actions with external integrations.
 - Implements idempotency to prevent duplicate executions
 - Records all actions with external references (issue #, URLs)
 
+### 🤝 **Merchant Response Pipeline** (Agent 11)
+Communicates with affected merchants and monitors support tickets.
+
+**Agent 11: Merchant Response & Support Ticket Monitor**
+- Classifies incidents as technical vs customer-facing issues
+- Generates personalized merchant communication for non-technical issues
+- Sends responses via email, in-app notifications, and support ticket replies
+- Monitors support tickets through resolution completion
+- Tracks customer satisfaction scores
+- Auto-closes resolved tickets with resolution summaries
+- Logs all merchant interactions for future learning
+- Escalates complex issues to human support agents
+
 ### 📚 **LEARN Pipeline** (Agent 10)
 Continuously improves from outcomes.
 
@@ -85,6 +98,7 @@ Continuously improves from outcomes.
 - Improves future response by adjusting triage rules
 - Trains models on incident-response patterns
 - Adjusts confidence scoring based on accuracy
+- Incorporates merchant feedback into knowledge base
 
 ---
 
@@ -224,6 +238,12 @@ cp .env.example .env
 │  Agent 9: Execute (GitHub, Slack, DataDog)                 │
 └─────────────────┬───────────────────────────────────────────┘
                   │ Executed Actions + External Refs
+                  ↓
+┌─────────────────────────────────────────────────────────────┐
+│             MERCHANT RESPONSE PIPELINE                      │
+│  Agent 11: Classify → Respond → Monitor Support Tickets    │
+└─────────────────┬───────────────────────────────────────────┘
+                  │ Merchant Communications & Ticket Status
                   ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                     LEARN PIPELINE                          │

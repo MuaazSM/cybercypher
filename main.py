@@ -21,6 +21,7 @@ from agents.action_planner import ActionPlannerAgent
 from agents.approval_gate import PolicyApprovalAgent
 from agents.execution import ExecutionAgent
 from agents.feedback import FeedbackLearningAgent
+from agents.merchant_response import MerchantResponseAgent
 from models.actions import Action
 from models.incidents import Incident
 from uuid import uuid4, UUID
@@ -69,6 +70,7 @@ agents_config = {
     "planner": ActionPlannerAgent(llm, kb),
     "approval_gate": PolicyApprovalAgent(),
     "executor": ExecutionAgent(slack, github, llm),
+    "merchant_response": MerchantResponseAgent(llm_client=llm),
     "feedback": FeedbackLearningAgent(kb)
 }
 
@@ -97,6 +99,8 @@ def run_workflow(auto_execute: bool = False):
         action_plans=[],
         approvals=[],
         executed_actions=[],
+        merchant_responses=[],
+        support_monitoring=[],
         outcomes=[],
         current_stage="observe",
         current_incident_id=None,

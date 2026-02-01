@@ -29,6 +29,7 @@ class AgenticWorkflow:
         workflow.add_node("decide", self._decide_node)
         workflow.add_node("approve", self._approve_node)
         workflow.add_node("act", self._act_node)
+        workflow.add_node("merchant_response", self._merchant_response_node)
         workflow.add_node("learn", self._learn_node)
 
         # Define edges (flow)
@@ -48,7 +49,8 @@ class AgenticWorkflow:
             }
         )
 
-        workflow.add_edge("act", "learn")
+        workflow.add_edge("act", "merchant_response")
+        workflow.add_edge("merchant_response", "learn")
         workflow.add_edge("learn", END)
 
         return workflow.compile()
@@ -339,6 +341,74 @@ class AgenticWorkflow:
 
         return state
 
+    def _merchant_response_node(self, state: AgentState) -> AgentState:
+        """
+        Merchant Response pipeline: Agent 11
+        - Classify issue as technical vs non-technical
+        - Send responses to affected merchants
+        - Monitor support tickets for resolution
+        """
+        print("[Graph] MERCHANT RESPONSE stage")
+
+        merchant_responses = []
+        support_monitoring = []
+
+        db = SessionLocal()
+        try:
+            for incident in state.get("incidents", []):
+                try:
+                    # Classify incident
+                    classification = self.agents["merchant_response"].classify_issue_type(incident, db)
+                    
+                    # If non-technical, generate and send response
+                    if classification.get("requires_merchant_response"):
+                        response = self.agents["merchant_response"].generate_merchant_response(
+                            incident, classification, db
+                        )
+                        
+                        if response:
+                            # Send to merchants
+                            send_result = self.agents["merchant_response"].send_merchant_responses(
+                                [response], incident, db
+                            )
+                            response["send_result"] = send_result
+                            merchant_responses.append(response)
+                            
+                            logger.info(
+                                f"[Workflow] Sent merchant responses for {incident.incident_id}: "
+                                f"{send_result['responses_sent']} sent, {send_result['responses_failed']} failed"
+                            )
+                    
+                    # Monitor support tickets
+                    monitoring = self.agents["merchant_response"].monitor_support_tickets(incident, db)
+                    support_monitoring.append(monitoring)
+                    
+                    # If tickets resolved, close them
+                    if monitoring.get("resolved_tickets"):
+                        resolution_summary = f"Incident {incident.incident_id} resolved. " \
+                                           f"Avg resolution time: {monitoring['avg_resolution_time']:.1f}h. " \
+                                           f"Satisfaction: {monitoring['customer_satisfaction_score']:.1f}/5"
+                        
+                        close_result = self.agents["merchant_response"].close_support_tickets(
+                            incident, resolution_summary, db
+                        )
+                        monitoring["close_result"] = close_result
+                        logger.info(
+                            f"[Workflow] Closed {close_result['tickets_closed']} support tickets for {incident.incident_id}"
+                        )
+                        
+                except Exception as e:
+                    logger.error(f"[Workflow] Merchant response error for incident: {e}")
+                    state.setdefault("errors", []).append(f"Merchant response error: {e}")
+        finally:
+            db.close()
+
+        state["merchant_responses"] = merchant_responses
+        state["support_monitoring"] = support_monitoring
+        state["current_stage"] = "merchant_response"
+
+        return state
+
     def _learn_node(self, state: AgentState) -> AgentState:
         """Learn pipeline: measure outcomes"""
         print("[Graph] LEARN stage")
@@ -377,6 +447,8 @@ class AgenticWorkflow:
                 action_plans=[],
                 approvals=[],
                 executed_actions=[],
+                merchant_responses=[],
+                support_monitoring=[],
                 outcomes=[],
                 current_stage="observe",
                 current_incident_id=None,

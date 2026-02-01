@@ -24,6 +24,9 @@ class AgentState(TypedDict):
     approvals: List[Approval]
     executed_actions: List[ExecutedAction]
     outcomes: List[ActionOutcome]
+    merchant_responses: List[dict]  # Agent 11: Merchant communication logs
+    support_monitoring: List[dict]  # Agent 11: Support ticket monitoring and resolution tracking
+    support_ticket_status: Optional[dict]  # Agent 11: Support ticket monitoring
 
     # Control flow
     current_stage: str

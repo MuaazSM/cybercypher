@@ -1,6 +1,8 @@
 import time
 import os
 import requests
+import json
+import sys
 from typing import List, Dict, Any, Optional
 from enum import Enum
 from datetime import datetime
@@ -82,6 +84,159 @@ class GitHubAPI:
         except requests.exceptions.RequestException as e:
             print(f"{Color.RED}GitHub connection error: {e}{Color.RESET}")
             return None
+
+
+class LLMClient:
+    """Real LLM API integration (OpenAI, Groq, or Gemini)"""
+    
+    def __init__(self):
+        self.openai_key = os.getenv("OPENAI_API_KEY")
+        self.groq_key = os.getenv("GROQ_API_KEY")
+        self.gemini_key = os.getenv("GEMINI_API_KEY")
+    
+    def generate_hypotheses(self, incident_context: str) -> List[Dict[str, Any]]:
+        """Call real LLM to generate root cause hypotheses"""
+        # Try OpenAI first
+        if self.openai_key:
+            return self._call_openai(incident_context)
+        # Fallback to Groq
+        elif self.groq_key:
+            return self._call_groq(incident_context)
+        # Fallback to Gemini
+        elif self.gemini_key:
+            return self._call_gemini(incident_context)
+        else:
+            # No API key, return simulated response with delay
+            time.sleep(2)
+            return self._simulated_response()
+    
+    def _call_openai(self, context: str) -> List[Dict[str, Any]]:
+        """Call OpenAI GPT-4 for root cause analysis"""
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            
+            from openai import OpenAI
+            client = OpenAI(api_key=self.openai_key)
+            
+            prompt = f"""You are a root cause analysis expert. Based on this incident context, generate 3 ranked hypotheses with confidence scores.
+
+Incident Context:
+{context}
+
+Return ONLY a JSON array with this format:
+[
+  {{"hypothesis": "Hypothesis 1 text", "confidence": 87, "evidence": ["point 1", "point 2"]}},
+  {{"hypothesis": "Hypothesis 2 text", "confidence": 65, "evidence": ["point 1", "point 2"]}},
+  {{"hypothesis": "Hypothesis 3 text", "confidence": 31, "evidence": ["point 1", "point 2"]}}
+]
+
+Be concise. Focus on technical accuracy."""
+
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            text = response.choices[0].message.content.strip()
+            # Extract JSON from response
+            start = text.find('[')
+            end = text.rfind(']') + 1
+            if start != -1 and end > start:
+                hypotheses = json.loads(text[start:end])
+                return hypotheses
+        except Exception as e:
+            print(f"{Color.DIM}(OpenAI call failed: {str(e)[:30]}...){Color.RESET}", flush=True)
+        
+        return self._simulated_response()
+    
+    def _call_groq(self, context: str) -> List[Dict[str, Any]]:
+        """Call Groq Llama for faster inference"""
+        try:
+            from groq import Groq
+            client = Groq(api_key=self.groq_key)
+            
+            prompt = f"""Root cause analysis. 3 hypotheses with confidence scores as JSON array only.
+            
+{context}
+
+Return ONLY JSON: [{{"hypothesis": "...", "confidence": 87, "evidence": [...]}}]"""
+
+            response = client.chat.completions.create(
+                model="mixtral-8x7b-32768",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=400
+            )
+            
+            text = response.choices[0].message.content.strip()
+            start = text.find('[')
+            end = text.rfind(']') + 1
+            if start != -1 and end > start:
+                hypotheses = json.loads(text[start:end])
+                return hypotheses
+        except Exception as e:
+            print(f"{Color.DIM}(Groq call failed: {str(e)[:30]}...){Color.RESET}", flush=True)
+        
+        return self._simulated_response()
+    
+    def _call_gemini(self, context: str) -> List[Dict[str, Any]]:
+        """Call Google Gemini for reasoning"""
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.gemini_key)
+            model = genai.GenerativeModel('gemini-pro')
+            
+            prompt = f"""Root cause hypotheses as JSON only.
+            
+{context}
+
+[{{"hypothesis": "...", "confidence": 87, "evidence": [...]}}]"""
+
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            start = text.find('[')
+            end = text.rfind(']') + 1
+            if start != -1 and end > start:
+                hypotheses = json.loads(text[start:end])
+                return hypotheses
+        except Exception as e:
+            print(f"{Color.DIM}(Gemini call failed: {str(e)[:30]}...){Color.RESET}", flush=True)
+        
+        return self._simulated_response()
+    
+    def _simulated_response(self) -> List[Dict[str, Any]]:
+        """Fallback simulated response (no API key)"""
+        return [
+            {
+                "hypothesis": "Payment gateway (Stripe/PayPal) experiencing timeout issues",
+                "confidence": 87,
+                "evidence": [
+                    "All failures tagged as payment_timeout",
+                    "No errors in our application logs",
+                    "Multiple payment methods affected",
+                    "Affects all merchants equally"
+                ]
+            },
+            {
+                "hypothesis": "Database connection pool exhaustion on payment service",
+                "confidence": 65,
+                "evidence": [
+                    "Checkout errors concentrated in payment processing",
+                    "Timeout pattern suggests resource constraint"
+                ]
+            },
+            {
+                "hypothesis": "DDoS attack targeting payment endpoints",
+                "confidence": 31,
+                "evidence": [
+                    "Sudden spike in errors",
+                    "Geographic distribution suggests coordinated"
+                ]
+            }
+        ]
 
 
 class TerminalPresenter:
@@ -418,40 +573,32 @@ Generate ranked hypotheses with confidence scores.
     
     presenter.animate_step("Calling LLM (OpenAI GPT-4) for analysis")
     presenter.animate_step("Retrieving historical similar incidents from knowledge base")
-    presenter.animate_step("Scoring hypotheses based on evidence alignment")
     
-    hypotheses = [
-        {
-            "rank": 1,
-            "hypothesis": "Payment gateway (Stripe/PayPal) experiencing timeout issues",
-            "confidence": "87%",
-            "evidence": [
-                "All failures tagged as payment_timeout",
-                "No errors in our application logs",
-                "Multiple payment methods affected",
-                "Affects all merchants equally"
-            ],
-            "supporting_data": "Similar incident occurred Jan 28 with same gateway"
-        },
-        {
-            "rank": 2,
-            "hypothesis": "Database connection pool exhaustion on payment service",
-            "confidence": "65%",
-            "evidence": [
-                "Checkout errors concentrated in payment processing",
-                "Timeout pattern suggests resource constraint"
-            ]
-        },
-        {
-            "rank": 3,
-            "hypothesis": "DDoS attack targeting payment endpoints",
-            "confidence": "31%",
-            "evidence": [
-                "Sudden spike in errors",
-                "Geographic distribution suggests coordinated"
-            ]
-        }
-    ]
+    # Call real LLM with realistic delay
+    print(f"\n{Color.YELLOW}→ Generating hypotheses...{Color.RESET}")
+    sys.stdout.flush()
+    
+    llm_client = LLMClient()
+    incident_context = """Payment processing timeout spike:
+- Error rate: 6.0% (baseline: 0.8%) - 7.5x deviation
+- Affected: All merchants, all payment methods
+- Timeline: Started 14:23:45 UTC
+- Pattern: Consistent timeout errors, no app errors
+- Similar past incidents: Jan 28 (gateway issue, resolved in 22 min)"""
+    
+    hypotheses_data = llm_client.generate_hypotheses(incident_context)
+    
+    # Convert to display format
+    hypotheses = []
+    for i, hyp in enumerate(hypotheses_data, 1):
+        hypotheses.append({
+            "rank": i,
+            "hypothesis": hyp["hypothesis"],
+            "confidence": f"{hyp['confidence']}%",
+            "evidence": hyp.get("evidence", [])
+        })
+    
+    presenter.animate_step("Scoring hypotheses based on evidence alignment")
     
     presenter.print_section("Hypotheses Generated", "Ranked by confidence score")
     
@@ -460,14 +607,6 @@ Generate ranked hypotheses with confidence scores.
         print(f"\n{color}{Color.BOLD}Hypothesis #{hyp['rank']}: {hyp['hypothesis']}{Color.RESET}")
         print(f"{Color.DIM}Confidence: {hyp['confidence']}{Color.RESET}")
         presenter.print_data("  Evidence", hyp["evidence"], indent=4)
-        
-        for analysis in pipeline.analyses:
-            if analysis.get("hypothesis_rank") == hyp["rank"]:
-                pipeline.analyses.append({
-                    "hypothesis_rank": hyp["rank"],
-                    "hypothesis": hyp["hypothesis"],
-                    "confidence": hyp["confidence"]
-                })
     
     analysis = {
         "incident_id": triage_result["incident_id"],
@@ -761,6 +900,119 @@ CyberShop Operations
 
 def demo_feedback_and_closure(presenter: TerminalPresenter, pipeline: Pipeline):
     """Demo feedback and incident closure"""
+    presenter.print_header("MERCHANT RESPONSE & TICKET MONITORING")
+    print("Agent 11 communicates with affected merchants and monitors support tickets.\n")
+    
+    # Agent 11: Merchant Response
+    presenter.print_section("Agent 11: Merchant Response & Support Monitor", "Analyzing customer impact and sending resolutions")
+    
+    presenter.animate_step("Classifying incident: Payment Gateway Issue (Technical - Revenue Impact)")
+    presenter.animate_step("Identifying 3 affected merchants")
+    presenter.animate_step("Determining incident type: Service Unavailability (Non-Technical)")
+    
+    presenter.wait()
+    
+    # Generate merchant responses
+    presenter.print_section("Generating Merchant Responses", "Creating personalized customer communication")
+    
+    response_template = """
+Dear Valued Merchant,
+
+We have successfully resolved the payment processing issue that affected your store on Feb 1st, 2025.
+
+**Issue Resolution:**
+• Service Status: RESTORED ✓
+• Time to Resolution: 22 minutes
+• Revenue Impact: $45,000 (fully recovered)
+
+**What Happened:**
+Our payment gateway experienced temporary timeout errors across all payment methods. This was caused by a database connection pool exhaustion on the provider's infrastructure.
+
+**Our Response:**
+1. Detected the issue within 2 minutes of onset
+2. Escalated to payment provider support
+3. Coordinated recovery with engineering team
+4. Implemented enhanced monitoring
+
+**Your Action Items:**
+1. Review your transaction logs for May 1st
+2. Reconcile any failed transactions (support team will assist)
+3. Monitor your payment dashboard over next 24 hours
+
+**Prevention:**
+We've added redundancy and implemented circuit breakers to prevent recurrence.
+
+Questions? Reply to this message or contact us at support@cybershop.com
+
+Best regards,
+CyberShop Operations Team
+"""
+    
+    presenter.print_code_block("Merchant Communication Template", response_template[:250] + "...")
+    
+    presenter.animate_step("Generating personalized response for merchant_xyz")
+    presenter.animate_step("Generating personalized response for merchant_abc")
+    presenter.animate_step("Generating personalized response for merchant_def")
+    
+    merchant_responses = [
+        {"merchant_id": "merchant_xyz", "status": "sent_email", "channel": "email"},
+        {"merchant_id": "merchant_abc", "status": "sent_email", "channel": "email"},
+        {"merchant_id": "merchant_def", "status": "sent_email", "channel": "email"}
+    ]
+    
+    print(f"\n{Color.GREEN}✓ Merchant Responses Sent{Color.RESET}\n")
+    
+    for response in merchant_responses:
+        presenter.print_data(f"  {response['merchant_id']}", f"{response['status']} via {response['channel']}", indent=4)
+    
+    presenter.wait()
+    
+    # Monitor support tickets
+    presenter.print_section("Monitoring Support Tickets", "Tracking resolution progress with customers")
+    
+    presenter.animate_step("Querying support ticket system (Zendesk integration)")
+    presenter.animate_step("Identifying 3 open support tickets from affected merchants")
+    presenter.animate_step("Tracking merchant feedback and satisfaction")
+    
+    presenter.print_data("Open tickets", 3, indent=4)
+    presenter.print_data("Resolved tickets", 0, indent=4)
+    presenter.print_data("Average satisfaction score", "4.6/5.0", indent=4)
+    
+    presenter.animate_step("Customer: 'Thank you for the quick resolution' - Satisfaction: 5/5")
+    presenter.animate_step("Customer: 'Great communication throughout' - Satisfaction: 4.5/5")
+    presenter.animate_step("Customer: 'Appreciate the detailed explanation' - Satisfaction: 4.7/5")
+    
+    presenter.wait()
+    
+    # Auto-close resolved tickets
+    presenter.print_section("Closing Support Tickets", "Auto-closing resolved tickets with resolution summary")
+    
+    resolution_summary = """
+Incident INC-2025-0201-001: Payment Processing Timeouts (RESOLVED)
+- Root Cause: Payment gateway database pool exhaustion
+- Resolution Time: 22 minutes
+- Merchants Affected: 3
+- Transactions Restored: 1,247
+- Revenue Recovered: $45,000
+- Customer Satisfaction: 4.6/5 (avg)
+
+All merchants have been notified. Support tickets marked for closure.
+"""
+    
+    presenter.print_code_block("Resolution Summary", resolution_summary)
+    
+    presenter.animate_step("Closing support ticket #2847 (merchant_xyz)")
+    presenter.animate_step("Closing support ticket #2848 (merchant_abc)")
+    presenter.animate_step("Closing support ticket #2849 (merchant_def)")
+    
+    presenter.print_success("✓ 3 support tickets closed successfully")
+    presenter.print_data("  Tickets Closed", 3, indent=4)
+    presenter.print_data("  Resolution Rate", "100%", indent=4)
+    presenter.print_data("  Customer Satisfaction (Average)", "4.6/5", indent=4)
+    
+    presenter.wait()
+
+    # FEEDBACK & LEARNING
     presenter.print_header("FEEDBACK & CLOSURE")
     print("The system learns from outcomes and closes the incident.\n")
     
@@ -795,13 +1047,15 @@ def demo_feedback_and_closure(presenter: TerminalPresenter, pipeline: Pipeline):
     presenter.animate_step("Storing successful action sequence for future reference")
     presenter.animate_step("Updating LLM context window with this incident pattern")
     presenter.animate_step("Improving triage rules: Similar timeouts now auto-escalate")
+    presenter.animate_step("Logging merchant communication effectiveness (4.6/5 satisfaction)")
     
-    presenter.print_data("Learning points added to knowledge base", 5, indent=4)
+    presenter.print_data("Learning points added to knowledge base", 6, indent=4)
     presenter.print_data("  1. Payment gateway timeouts", "Confidence: 92%", indent=6)
     presenter.print_data("  2. Recommended response sequence", "GitHub → Comms → Monitor", indent=6)
     presenter.print_data("  3. Recovery pattern", "~20-30 minute window typical", indent=6)
     presenter.print_data("  4. Related incident", "Jan 28 incident context", indent=6)
     presenter.print_data("  5. Future optimization", "Pre-escalate to payments team", indent=6)
+    presenter.print_data("  6. Merchant communication", "Personalized responses increase satisfaction to 4.6/5", indent=6)
     
     presenter.wait()
     
@@ -864,6 +1118,7 @@ def main():
         print("  REASON   → Analyze and hypothesize root causes")
         print("  DECIDE   → Plan and approve actions")
         print("  ACT      → Execute and monitor")
+        print("  MERCHANT → Respond to customers and track tickets (Agent 11)")
         print("  LEARN    → Improve from outcomes\n")
         print("This demo shows a real payment processing incident flowing through each stage.\n")
         
@@ -888,12 +1143,13 @@ def main():
         presenter.print_header("DEMO COMPLETE")
         print(f"{Color.BOLD}{Color.GREEN}The CyberCypher agent successfully handled an incident!{Color.RESET}\n")
         print("Key Technical Highlights:\n")
-        print("  1. Multi-agent architecture with specialized responsibilities")
+        print("  1. Multi-agent architecture with 11 specialized agents")
         print("  2. LLM-powered reasoning with confidence scoring")
         print("  3. Policy-based approval gates for governance")
         print("  4. Real integrations: GitHub issues, Slack notifications")
-        print("  5. Continuous learning from outcomes")
-        print("  6. Audit trail for compliance and debugging\n")
+        print("  5. Automated merchant communication with support ticket monitoring")
+        print("  6. Continuous learning from outcomes")
+        print("  7. Audit trail for compliance and debugging\n")
         
         print(f"{Color.BOLD}Performance Metrics:{Color.RESET}")
         print(f"  Demo walkthrough time: {demo_elapsed:.1f} seconds")
